@@ -1,8 +1,8 @@
-openai
-openai-whisper
-pyaudio
-pynput
-keyboard
-argparse
-rumps
-numpy
+faster-whisper>=1.1.0
+pyaudio>=0.2.13
+pynput>=1.7.6
+pystray>=0.2.8
+Pillow>=10.0.0
+numpy>=1.24.0
+nvidia-cublas-cu12>=12.4.2
+nvidia-cudnn-cu12>=9.1.0

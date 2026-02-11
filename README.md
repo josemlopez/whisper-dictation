@@ -1,71 +1,94 @@
-# Multilingual Dictation App based on OpenAI Whisper
-Multilingual dictation app based on the powerful OpenAI Whisper ASR model(s) to provide accurate and efficient speech-to-text conversion in any application. The app runs in the background and is triggered through a keyboard shortcut. It is also entirely offline, so no data will be shared. It allows users to set up their own keyboard combinations and choose from different Whisper models, and languages.
+# Whisper Dictation (Windows / CUDA)
 
-## Prerequisites
-The PortAudio and llvm library is required for this app to work. You can install it on macOS using the following command:
+Real-time speech-to-text dictation for Windows using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with NVIDIA CUDA acceleration. Text is typed directly where your cursor has focus — works in any application.
 
-```bash
-brew install portaudio llvm
-```
+Forked from [foges/whisper-dictation](https://github.com/foges/whisper-dictation) (macOS-only) and rewritten for Windows with real-time streaming transcription.
 
-## Permissions
-The app requires accessibility permissions to register global hotkeys and permission to access your microphone for speech recognition.
+## Features
+
+- **Real-time streaming** — text appears as you speak, not after you stop
+- **GPU-accelerated** — uses faster-whisper with CTranslate2 on CUDA (float16)
+- **Works everywhere** — types into whatever window has focus (editor, browser, chat, etc.)
+- **System tray** — green/red icon shows ready/recording status
+- **Hotkey toggle** — Ctrl+Space to start/stop (configurable)
+- **Multilingual** — supports all Whisper languages, with language switching from the tray menu
+- **Offline** — everything runs locally, no data leaves your machine
+
+## Requirements
+
+- Windows 10/11
+- Python 3.10–3.12
+- NVIDIA GPU with CUDA support (tested on RTX 4090)
+- Microphone
 
 ## Installation
-Clone the repository:
 
 ```bash
-git clone https://github.com/foges/whisper-dictation.git
+git clone https://github.com/jmslay/whisper-dictation.git
 cd whisper-dictation
-```
-
-If you use poetry:
-
-```shell
-poetry install
-poetry shell
-```
-
-Or, if you don't use poetry, first create a virtual environment:
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-Install the required packages:
-
-```bash
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+The first run will download the Whisper model (~1.5 GB for `large-v3-turbo`).
+
 ## Usage
-Run the application:
 
 ```bash
 python whisper-dictation.py
 ```
 
-By default, the app uses the "base" Whisper ASR model and the key combination to toggle dictation is cmd+option on macOS and ctrl+alt on other platforms. You can change the model and the key combination using command-line arguments.  Note that models other than `tiny` and `base` can be slow to transcribe and are not recommended unless you're using a powerful computer, ideally one with a CUDA-enabled GPU. For example:
+Press **Ctrl+Space** to start dictating. Press again to stop. Text is typed wherever your cursor is.
 
+### Command-line options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-m`, `--model_name` | Whisper model (`tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3`, `large-v3-turbo`, `turbo`) | `large-v3-turbo` |
+| `-k`, `--key_combination` | Hotkey to toggle recording | `ctrl_l+space` |
+| `-l`, `--language` | Language code(s), comma-separated (e.g. `es` or `es,en`) | auto-detect |
+| `-t`, `--max_time` | Max recording duration in seconds | `120` |
+| `--chunk` | Streaming chunk duration in seconds | `2.0` |
+| `--device` | Inference device (`cuda` or `cpu`) | `cuda` |
+| `--compute_type` | Compute type (`float16`, `int8`, `float32`) | `float16` |
+
+### Examples
 
 ```bash
-python whisper-dictation.py -m large -k cmd_r+shift -l en
+# Spanish dictation with large-v3-turbo (recommended)
+python whisper-dictation.py -m large-v3-turbo -l es
+
+# English-only, smaller model for less VRAM
+python whisper-dictation.py -m small.en -l en
+
+# Multi-language with switching from tray menu
+python whisper-dictation.py -l es,en,fr
+
+# CPU-only (slower, no GPU needed)
+python whisper-dictation.py --device cpu --compute_type int8
 ```
 
-The models are multilingual, and you can specify a two-letter language code (e.g., "no" for Norwegian) with the `-l` or `--language` option. Specifying the language can improve recognition accuracy, especially for smaller model sizes.
+### Quick launcher (run.bat)
 
-#### Replace macOS default dictation trigger key
-You can use this app to replace macOS built-in dictation. Trigger to begin recording with a double click of Right Command key and stop recording with a single click of Right Command key.
-```bash
-python whisper-dictation.py -m large --k_double_cmd -l en
-```
-To use this trigger, go to System Settings -> Keyboard, disable Dictation. If you double click Right Command key on any text field, macOS will ask whether you want to enable Dictation, so select Don't Ask Again.
+Edit `run.bat` to set your preferred options, then double-click or add to startup.
 
-## Setting the App as a Startup Item
-To have the app run automatically when your computer starts, follow these steps:
+## How it works
 
- 1. Open System Preferences.
- 2. Go to Users & Groups.
- 3. Click on your username, then select the Login Items tab.
- 4. Click the + button and add the `run.sh` script from the whisper-dictation folder.
+1. Audio is captured from your microphone at 16kHz
+2. Every 2 seconds (configurable), the audio chunk is sent to faster-whisper for transcription
+3. New text is incrementally typed into the focused application using pynput
+4. A 0.5s overlap between chunks maintains context continuity
+5. VAD (Voice Activity Detection) filters out silence
+
+## Troubleshooting
+
+See [FAQ.md](FAQ.md) for common issues and solutions.
+
+## License
+
+MIT License — see [LICENSE](LICENSE).
+
+Copyright (c) 2025 Jose Lopez. Based on [whisper-dictation](https://github.com/foges/whisper-dictation) by Chris Fougner.
+
+If you use this software, please include attribution to **Jose Lopez** as required by the license.

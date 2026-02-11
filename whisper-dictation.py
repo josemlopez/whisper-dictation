@@ -1,67 +1,137 @@
 import argparse
 import time
 import threading
+import sys
+import os
 import pyaudio
 import numpy as np
-import rumps
 from pynput import keyboard
-from whisper import load_model
 import platform
 
-class SpeechTranscriber:
-    def __init__(self, model):
+# Add NVIDIA CUDA DLLs to PATH before importing faster_whisper
+_venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
+for _pkg in ("nvidia/cublas/bin", "nvidia/cudnn/bin"):
+    _dll_path = os.path.join(_venv, "Lib", "site-packages", _pkg)
+    if os.path.isdir(_dll_path):
+        os.add_dll_directory(_dll_path)
+        os.environ["PATH"] = _dll_path + os.pathsep + os.environ.get("PATH", "")
+
+from faster_whisper import WhisperModel
+
+if platform.system() == "Windows":
+    import pystray
+    from PIL import Image, ImageDraw
+
+
+class StreamingTranscriber:
+    """Transcribes audio in real-time using faster-whisper, typing text as you speak."""
+
+    def __init__(self, model, chunk_duration=2.0, overlap_duration=0.5):
         self.model = model
         self.pykeyboard = keyboard.Controller()
+        self.chunk_duration = chunk_duration
+        self.overlap_duration = overlap_duration
 
-    def transcribe(self, audio_data, language=None):
-        result = self.model.transcribe(audio_data, language=language)
-        is_first = True
-        for element in result["text"]:
-            if is_first and element == " ":
-                is_first = False
-                continue
-
+    def type_text(self, text):
+        for char in text:
             try:
-                self.pykeyboard.type(element)
-                time.sleep(0.0025)
+                self.pykeyboard.type(char)
+                time.sleep(0.002)
             except:
                 pass
 
-class Recorder:
+    def transcribe_chunk(self, audio_data, language=None):
+        segments, _ = self.model.transcribe(
+            audio_data,
+            language=language,
+            beam_size=1,
+            best_of=1,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=300),
+            without_timestamps=True,
+        )
+        text = ""
+        for segment in segments:
+            text += segment.text
+        return text.strip()
+
+
+class StreamingRecorder:
+    """Records audio and streams chunks to the transcriber in real-time."""
+
     def __init__(self, transcriber):
         self.recording = False
         self.transcriber = transcriber
+        self._thread = None
 
     def start(self, language=None):
-        thread = threading.Thread(target=self._record_impl, args=(language,))
-        thread.start()
+        self.recording = True
+        self._thread = threading.Thread(target=self._stream_impl, args=(language,), daemon=True)
+        self._thread.start()
 
     def stop(self):
         self.recording = False
+        if self._thread:
+            self._thread.join(timeout=5)
 
-
-    def _record_impl(self, language):
-        self.recording = True
+    def _stream_impl(self, language):
+        sample_rate = 16000
         frames_per_buffer = 1024
+        chunk_samples = int(self.transcriber.chunk_duration * sample_rate)
+        overlap_samples = int(self.transcriber.overlap_duration * sample_rate)
+
         p = pyaudio.PyAudio()
-        stream = p.open(format=pyaudio.paInt16,
-                        channels=1,
-                        rate=16000,
-                        frames_per_buffer=frames_per_buffer,
-                        input=True)
-        frames = []
+        stream = p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=sample_rate,
+            frames_per_buffer=frames_per_buffer,
+            input=True,
+        )
 
-        while self.recording:
-            data = stream.read(frames_per_buffer)
-            frames.append(data)
+        audio_buffer = np.array([], dtype=np.float32)
+        prev_text = ""
 
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+        try:
+            while self.recording:
+                data = stream.read(frames_per_buffer, exception_on_overflow=False)
+                chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                audio_buffer = np.concatenate([audio_buffer, chunk])
 
-        audio_data = np.frombuffer(b''.join(frames), dtype=np.int16)
-        audio_data_fp32 = audio_data.astype(np.float32) / 32768.0
-        self.transcriber.transcribe(audio_data_fp32, language)
+                if len(audio_buffer) >= chunk_samples:
+                    text = self.transcriber.transcribe_chunk(audio_buffer, language)
+
+                    if text and text != prev_text:
+                        if prev_text and text.startswith(prev_text):
+                            new_text = text[len(prev_text):]
+                        elif prev_text:
+                            new_text = " " + text
+                        else:
+                            new_text = text
+
+                        if new_text.strip():
+                            self.transcriber.type_text(new_text)
+
+                        prev_text = text
+
+                    # Keep overlap for context continuity
+                    audio_buffer = audio_buffer[-overlap_samples:]
+
+            # Process remaining audio
+            if len(audio_buffer) > sample_rate * 0.3:  # At least 0.3s of audio
+                text = self.transcriber.transcribe_chunk(audio_buffer, language)
+                if text and text != prev_text:
+                    if prev_text and text.startswith(prev_text):
+                        new_text = text[len(prev_text):]
+                    else:
+                        new_text = " " + text
+                    if new_text.strip():
+                        self.transcriber.type_text(new_text)
+
+        finally:
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
 
 
 class GlobalKeyListener:
@@ -70,12 +140,18 @@ class GlobalKeyListener:
         self.key1, self.key2 = self.parse_key_combination(key_combination)
         self.key1_pressed = False
         self.key2_pressed = False
+        self._toggled = False
 
     def parse_key_combination(self, key_combination):
         key1_name, key2_name = key_combination.split('+')
-        key1 = getattr(keyboard.Key, key1_name, keyboard.KeyCode(char=key1_name))
-        key2 = getattr(keyboard.Key, key2_name, keyboard.KeyCode(char=key2_name))
+        key1 = self._parse_key(key1_name)
+        key2 = self._parse_key(key2_name)
         return key1, key2
+
+    def _parse_key(self, key_name):
+        if key_name == 'space':
+            return keyboard.Key.space
+        return getattr(keyboard.Key, key_name, keyboard.KeyCode(char=key_name))
 
     def on_key_press(self, key):
         if key == self.key1:
@@ -83,146 +159,135 @@ class GlobalKeyListener:
         elif key == self.key2:
             self.key2_pressed = True
 
-        if self.key1_pressed and self.key2_pressed:
+        if self.key1_pressed and self.key2_pressed and not self._toggled:
+            self._toggled = True
             self.app.toggle()
 
     def on_key_release(self, key):
         if key == self.key1:
             self.key1_pressed = False
+            self._toggled = False
         elif key == self.key2:
             self.key2_pressed = False
+            self._toggled = False
 
-class DoubleCommandKeyListener:
-    def __init__(self, app):
-        self.app = app
-        self.key = keyboard.Key.cmd_r
-        self.pressed = 0
-        self.last_press_time = 0
 
-    def on_key_press(self, key):
-        is_listening = self.app.started
-        if key == self.key:
-            current_time = time.time()
-            if not is_listening and current_time - self.last_press_time < 0.5:  # Double click to start listening
-                self.app.toggle()
-            elif is_listening:  # Single click to stop listening
-                self.app.toggle()
-            self.last_press_time = current_time
+def create_tray_icon(color):
+    img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([8, 8, 56, 56], fill=color)
+    return img
 
-    def on_key_release(self, key):
-        pass
 
-class StatusBarApp(rumps.App):
+class WhisperDictationApp:
     def __init__(self, recorder, languages=None, max_time=None):
-        super().__init__("whisper", "⏯")
         self.languages = languages
-        self.current_language = languages[0] if languages is not None else None
-
-        menu = [
-            'Start Recording',
-            'Stop Recording',
-            None,
-        ]
-
-        if languages is not None:
-            for lang in languages:
-                callback = self.change_language if lang != self.current_language else None
-                menu.append(rumps.MenuItem(lang, callback=callback))
-            menu.append(None)
-            
-        self.menu = menu
-        self.menu['Stop Recording'].set_callback(None)
-
+        self.current_language = languages[0] if languages else None
         self.started = False
         self.recorder = recorder
         self.max_time = max_time
         self.timer = None
-        self.elapsed_time = 0
-
-    def change_language(self, sender):
-        self.current_language = sender.title
-        for lang in self.languages:
-            self.menu[lang].set_callback(self.change_language if lang != self.current_language else None)
-
-    @rumps.clicked('Start Recording')
-    def start_app(self, _):
-        print('Listening...')
-        self.started = True
-        self.menu['Start Recording'].set_callback(None)
-        self.menu['Stop Recording'].set_callback(self.stop_app)
-        self.recorder.start(self.current_language)
-
-        if self.max_time is not None:
-            self.timer = threading.Timer(self.max_time, lambda: self.stop_app(None))
-            self.timer.start()
-
-        self.start_time = time.time()
-        self.update_title()
-
-    @rumps.clicked('Stop Recording')
-    def stop_app(self, _):
-        if not self.started:
-            return
-        
-        if self.timer is not None:
-            self.timer.cancel()
-
-        print('Transcribing...')
-        self.title = "⏯"
-        self.started = False
-        self.menu['Stop Recording'].set_callback(None)
-        self.menu['Start Recording'].set_callback(self.start_app)
-        self.recorder.stop()
-        print('Done.\n')
-
-    def update_title(self):
-        if self.started:
-            self.elapsed_time = int(time.time() - self.start_time)
-            minutes, seconds = divmod(self.elapsed_time, 60)
-            self.title = f"({minutes:02d}:{seconds:02d}) 🔴"
-            threading.Timer(1, self.update_title).start()
+        self.tray = None
 
     def toggle(self):
         if self.started:
-            self.stop_app(None)
+            self.stop()
         else:
-            self.start_app(None)
+            self.start()
+
+    def start(self):
+        print('Recording + streaming transcription...')
+        self.started = True
+        self.recorder.start(self.current_language)
+
+        if self.max_time is not None:
+            self.timer = threading.Timer(self.max_time, self.stop)
+            self.timer.start()
+
+        if self.tray:
+            self.tray.icon = create_tray_icon('red')
+            self.tray.title = "Whisper - RECORDING"
+
+    def stop(self):
+        if not self.started:
+            return
+
+        if self.timer is not None:
+            self.timer.cancel()
+
+        print('Stopping...')
+        self.started = False
+        self.recorder.stop()
+
+        if self.tray:
+            self.tray.icon = create_tray_icon('green')
+            self.tray.title = "Whisper - Ready (Ctrl+Space)"
+
+        print('Ready.\n')
+
+    def quit(self):
+        if self.started:
+            self.stop()
+        if self.tray:
+            self.tray.stop()
+
+    def run(self):
+        menu_items = [
+            pystray.MenuItem("Start/Stop (Ctrl+Space)", lambda: self.toggle()),
+        ]
+
+        if self.languages and len(self.languages) > 1:
+            lang_items = []
+            for lang in self.languages:
+                lang_items.append(
+                    pystray.MenuItem(lang, lambda _, l=lang: self._set_language(l),
+                                     checked=lambda item, l=lang: self.current_language == l)
+                )
+            menu_items.append(pystray.MenuItem("Language", pystray.Menu(*lang_items)))
+
+        menu_items.append(pystray.MenuItem("Quit", lambda: self.quit()))
+
+        self.tray = pystray.Icon(
+            "whisper-dictation",
+            create_tray_icon('green'),
+            "Whisper - Ready (Ctrl+Space)",
+            pystray.Menu(*menu_items)
+        )
+        self.tray.run()
+
+    def _set_language(self, lang):
+        self.current_language = lang
+        print(f"Language: {lang}")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Dictation app using the OpenAI whisper ASR model. By default the keyboard shortcut cmd+option '
-        'starts and stops dictation')
+        description='Real-time dictation with faster-whisper. Ctrl+Space to toggle.')
     parser.add_argument('-m', '--model_name', type=str,
-                        choices=['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large'],
-                        default='base',
-                        help='Specify the whisper ASR model to use. Options: tiny, base, small, medium, or large. '
-                        'To see the  most up to date list of models along with model size, memory footprint, and estimated '
-                        'transcription speed check out this [link](https://github.com/openai/whisper#available-models-and-languages). '
-                        'Note that the models ending in .en are trained only on English speech and will perform better on English '
-                        'language. Note that the small, medium, and large models may be slow to transcribe and are only recommended '
-                        'if you find the base model to be insufficient. Default: base.')
-    parser.add_argument('-k', '--key_combination', type=str, default='cmd_l+alt' if platform.system() == 'Darwin' else 'ctrl+alt',
-                        help='Specify the key combination to toggle the app. Example: cmd_l+alt for macOS '
-                        'ctrl+alt for other platforms. Default: cmd_r+alt (macOS) or ctrl+alt (others).')
-    parser.add_argument('--k_double_cmd', action='store_true',
-                            help='If set, use double Right Command key press on macOS to toggle the app (double click to begin recording, single click to stop recording). '
-                                 'Ignores the --key_combination argument.')
+                        choices=['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en',
+                                 'medium', 'medium.en', 'large-v2', 'large-v3',
+                                 'large-v3-turbo', 'turbo'],
+                        default='large-v3-turbo',
+                        help='Whisper model. Default: large-v3-turbo')
+    parser.add_argument('-k', '--key_combination', type=str, default='ctrl_l+space',
+                        help='Key combo to toggle. Default: ctrl_l+space')
     parser.add_argument('-l', '--language', type=str, default=None,
-                        help='Specify the two-letter language code (e.g., "en" for English) to improve recognition accuracy. '
-                        'This can be especially helpful for smaller model sizes.  To see the full list of supported languages, '
-                        'check out the official list [here](https://github.com/openai/whisper/blob/main/whisper/tokenizer.py).')
-    parser.add_argument('-t', '--max_time', type=float, default=30,
-                        help='Specify the maximum recording time in seconds. The app will automatically stop recording after this duration. '
-                        'Default: 30 seconds.')
+                        help='Language code, e.g. "es" or "es,en" for multi.')
+    parser.add_argument('-t', '--max_time', type=float, default=120,
+                        help='Max recording seconds. Default: 120')
+    parser.add_argument('--chunk', type=float, default=2.0,
+                        help='Chunk duration in seconds for streaming. Default: 2.0')
+    parser.add_argument('--device', type=str, default='cuda',
+                        choices=['cuda', 'cpu'],
+                        help='Device for inference. Default: cuda')
+    parser.add_argument('--compute_type', type=str, default='float16',
+                        choices=['float16', 'int8', 'int8_float16', 'float32'],
+                        help='Compute type. float16 for GPU, int8 for CPU. Default: float16')
 
     args = parser.parse_args()
 
     if args.language is not None:
         args.language = args.language.split(',')
-
-    if args.model_name.endswith('.en') and args.language is not None and any(lang != 'en' for lang in args.language):
-        raise ValueError('If using a model ending in .en, you cannot specify a language other than English.')
 
     return args
 
@@ -230,22 +295,18 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    print("Loading model...")
-    model_name = args.model_name
-    model = load_model(model_name)
-    print(f"{model_name} model loaded")
-    
-    transcriber = SpeechTranscriber(model)
-    recorder = Recorder(transcriber)
-    
-    app = StatusBarApp(recorder, args.language, args.max_time)
-    if args.k_double_cmd:
-        key_listener = DoubleCommandKeyListener(app)
-    else:
-        key_listener = GlobalKeyListener(app, args.key_combination)
+    print(f"Loading faster-whisper model '{args.model_name}' on {args.device} ({args.compute_type})...")
+    model = WhisperModel(args.model_name, device=args.device, compute_type=args.compute_type)
+    print(f"Model loaded!")
+
+    transcriber = StreamingTranscriber(model, chunk_duration=args.chunk)
+    recorder = StreamingRecorder(transcriber)
+
+    app = WhisperDictationApp(recorder, args.language, args.max_time)
+    key_listener = GlobalKeyListener(app, args.key_combination)
     listener = keyboard.Listener(on_press=key_listener.on_key_press, on_release=key_listener.on_key_release)
     listener.start()
 
-    print("Running... ")
+    print(f"Running! Press Ctrl+Space to start/stop dictation.")
+    print(f"Text will appear where your cursor is, in real-time.")
     app.run()
-

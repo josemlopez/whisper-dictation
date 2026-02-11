@@ -1,1 +1,11 @@
-venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.log
+whisper.log
+poetry.lock
+.env
