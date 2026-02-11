@@ -49,7 +49,7 @@ Press **Ctrl+Space** to start dictating. Press again to stop. Text is typed wher
 | `-k`, `--key_combination` | Hotkey to toggle recording | `ctrl_l+space` |
 | `-l`, `--language` | Language code(s), comma-separated (e.g. `es` or `es,en`) | auto-detect |
 | `-t`, `--max_time` | Max recording duration in seconds | `120` |
-| `--chunk` | Streaming chunk duration in seconds | `2.0` |
+| `--chunk` | Streaming chunk duration in seconds | `5.0` |
 | `--device` | Inference device (`cuda` or `cpu`) | `cuda` |
 | `--compute_type` | Compute type (`float16`, `int8`, `float32`) | `float16` |
 
@@ -73,10 +73,26 @@ python whisper-dictation.py --device cpu --compute_type int8
 
 Edit `run.bat` to set your preferred options, then double-click or add to startup.
 
+### Start with Windows
+
+To launch automatically on login (no terminal window):
+
+```powershell
+New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WhisperDictation' -Value '"C:\path\to\whisper-dictation\.venv\Scripts\pythonw.exe" -u "C:\path\to\whisper-dictation\whisper-dictation.py" -m large-v3-turbo -l es' -PropertyType String -Force
+```
+
+Replace `C:\path\to\whisper-dictation` with your actual install path.
+
+To remove from startup:
+
+```powershell
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'WhisperDictation'
+```
+
 ## How it works
 
 1. Audio is captured from your microphone at 16kHz
-2. Every 2 seconds (configurable), the audio chunk is sent to faster-whisper for transcription
+2. Every 5 seconds (configurable), the audio chunk is sent to faster-whisper for transcription
 3. New text is incrementally typed into the focused application using pynput
 4. A 0.5s overlap between chunks maintains context continuity
 5. VAD (Voice Activity Detection) filters out silence
