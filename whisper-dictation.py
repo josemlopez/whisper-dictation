@@ -54,6 +54,14 @@ class StreamingTranscriber:
         rms = np.sqrt(np.mean(audio_data ** 2))
         return rms > self.energy_threshold
 
+    def warmup(self):
+        """Run a tiny silent inference to wake up the GPU/model."""
+        silent = np.zeros(16000, dtype=np.float32)  # 1 second of silence
+        segments, _ = self.model.transcribe(silent, beam_size=1, best_of=1,
+                                            without_timestamps=True)
+        for _ in segments:
+            pass
+
     def transcribe_chunk(self, audio_data, language=None):
         if not self.has_speech(audio_data):
             return ""
@@ -85,6 +93,7 @@ class StreamingRecorder:
         self.recording = True
         self._thread = threading.Thread(target=self._stream_impl, args=(language,), daemon=True)
         self._thread.start()
+
 
     def stop(self):
         self.recording = False
@@ -133,17 +142,6 @@ class StreamingRecorder:
 
                     # Keep overlap for context continuity
                     audio_buffer = audio_buffer[-overlap_samples:]
-
-            # Process remaining audio
-            if len(audio_buffer) > sample_rate * 0.3:  # At least 0.3s of audio
-                text = self.transcriber.transcribe_chunk(audio_buffer, language)
-                if text and text != prev_text:
-                    if prev_text and text.startswith(prev_text):
-                        new_text = text[len(prev_text):]
-                    else:
-                        new_text = " " + text
-                    if new_text.strip():
-                        self.transcriber.type_text(new_text)
 
         finally:
             stream.stop_stream()
@@ -300,10 +298,19 @@ class WhisperDictationApp:
             self.tray.stop()
         self.indicator.destroy()
 
+    def _keepalive_loop(self):
+        """Periodically warm up the model so GPU stays ready."""
+        while True:
+            time.sleep(60)
+            if not self.started:
+                try:
+                    self.recorder.transcriber.warmup()
+                except:
+                    pass
+
     def run(self):
-        # pystray runs in a background thread
         threading.Thread(target=self._run_tray, daemon=True).start()
-        # tkinter runs on the main thread (required by Windows)
+        threading.Thread(target=self._keepalive_loop, daemon=True).start()
         self.indicator.run()
 
     def _run_tray(self):
@@ -375,6 +382,9 @@ if __name__ == "__main__":
     print(f"Model loaded!")
 
     transcriber = StreamingTranscriber(model, chunk_duration=args.chunk)
+    print("Warming up model...")
+    transcriber.warmup()
+    print("Warm-up done!")
     recorder = StreamingRecorder(transcriber)
 
     app = WhisperDictationApp(recorder, args.language, args.max_time)
