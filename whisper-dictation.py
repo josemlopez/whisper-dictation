@@ -213,16 +213,21 @@ class FloatingIndicator:
         self.canvas = tk.Canvas(self.root, width=size, height=size,
                                 bg='black', highlightthickness=0)
         self.canvas.pack()
-        self.dot = self.canvas.create_oval(2, 2, size - 2, size - 2, fill='#22c55e',
+        self.dot = self.canvas.create_oval(2, 2, size - 2, size - 2, fill='#ef4444',
                                            outline='')
+        self.root.withdraw()  # Start hidden
 
     def set_recording(self, recording):
         """Thread-safe: schedules the update on the tkinter main thread."""
         self.root.after(0, self._do_set_recording, recording)
 
     def _do_set_recording(self, recording):
-        color = '#ef4444' if recording else '#22c55e'
-        self.canvas.itemconfig(self.dot, fill=color)
+        if recording:
+            self.canvas.itemconfig(self.dot, fill='#ef4444')
+            self.root.deiconify()
+            self.root.lift()
+        else:
+            self.root.withdraw()
 
     def run(self):
         """Blocks — runs the tkinter mainloop on the main thread."""
