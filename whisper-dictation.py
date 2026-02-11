@@ -7,6 +7,8 @@ import pyaudio
 import numpy as np
 from pynput import keyboard
 import platform
+import winsound
+import tkinter as tk
 
 # Add NVIDIA CUDA DLLs to PATH before importing faster_whisper
 _venv = os.path.dirname(os.path.dirname(os.path.abspath(sys.executable)))
@@ -26,28 +28,43 @@ if platform.system() == "Windows":
 class StreamingTranscriber:
     """Transcribes audio in real-time using faster-whisper, typing text as you speak."""
 
-    def __init__(self, model, chunk_duration=2.0, overlap_duration=0.5):
+    def __init__(self, model, chunk_duration=5.0, overlap_duration=0.5,
+                 energy_threshold=0.003):
         self.model = model
         self.pykeyboard = keyboard.Controller()
         self.chunk_duration = chunk_duration
         self.overlap_duration = overlap_duration
+        self.energy_threshold = energy_threshold
+        self.typing = False
 
     def type_text(self, text):
-        for char in text:
-            try:
-                self.pykeyboard.type(char)
-                time.sleep(0.002)
-            except:
-                pass
+        self.typing = True
+        try:
+            for char in text:
+                try:
+                    self.pykeyboard.type(char)
+                    time.sleep(0.002)
+                except:
+                    pass
+        finally:
+            self.typing = False
+
+    def has_speech(self, audio_data):
+        """Check if audio has enough energy to contain speech."""
+        rms = np.sqrt(np.mean(audio_data ** 2))
+        return rms > self.energy_threshold
 
     def transcribe_chunk(self, audio_data, language=None):
+        if not self.has_speech(audio_data):
+            return ""
+
         segments, _ = self.model.transcribe(
             audio_data,
             language=language,
             beam_size=1,
             best_of=1,
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=300),
+            vad_parameters=dict(min_silence_duration_ms=500),
             without_timestamps=True,
         )
         text = ""
@@ -135,8 +152,9 @@ class StreamingRecorder:
 
 
 class GlobalKeyListener:
-    def __init__(self, app, key_combination):
+    def __init__(self, app, key_combination, transcriber):
         self.app = app
+        self.transcriber = transcriber
         self.key1, self.key2 = self.parse_key_combination(key_combination)
         self.key1_pressed = False
         self.key2_pressed = False
@@ -154,6 +172,8 @@ class GlobalKeyListener:
         return getattr(keyboard.Key, key_name, keyboard.KeyCode(char=key_name))
 
     def on_key_press(self, key):
+        if self.transcriber.typing:
+            return
         if key == self.key1:
             self.key1_pressed = True
         elif key == self.key2:
@@ -164,12 +184,52 @@ class GlobalKeyListener:
             self.app.toggle()
 
     def on_key_release(self, key):
+        if self.transcriber.typing:
+            return
         if key == self.key1:
             self.key1_pressed = False
             self._toggled = False
         elif key == self.key2:
             self.key2_pressed = False
             self._toggled = False
+
+
+class FloatingIndicator:
+    """Small always-on-top dot in the corner of the screen. Runs on main thread."""
+
+    def __init__(self, size=24, margin=10):
+        self.size = size
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+        self.root.attributes('-topmost', True)
+        self.root.attributes('-transparentcolor', 'black')
+        self.root.configure(bg='black')
+
+        screen_w = self.root.winfo_screenwidth()
+        x = screen_w - size - margin
+        y = margin
+        self.root.geometry(f'{size}x{size}+{x}+{y}')
+
+        self.canvas = tk.Canvas(self.root, width=size, height=size,
+                                bg='black', highlightthickness=0)
+        self.canvas.pack()
+        self.dot = self.canvas.create_oval(2, 2, size - 2, size - 2, fill='#22c55e',
+                                           outline='')
+
+    def set_recording(self, recording):
+        """Thread-safe: schedules the update on the tkinter main thread."""
+        self.root.after(0, self._do_set_recording, recording)
+
+    def _do_set_recording(self, recording):
+        color = '#ef4444' if recording else '#22c55e'
+        self.canvas.itemconfig(self.dot, fill=color)
+
+    def run(self):
+        """Blocks — runs the tkinter mainloop on the main thread."""
+        self.root.mainloop()
+
+    def destroy(self):
+        self.root.after(0, self.root.destroy)
 
 
 def create_tray_icon(color):
@@ -188,6 +248,7 @@ class WhisperDictationApp:
         self.max_time = max_time
         self.timer = None
         self.tray = None
+        self.indicator = FloatingIndicator()
 
     def toggle(self):
         if self.started:
@@ -199,6 +260,8 @@ class WhisperDictationApp:
         print('Recording + streaming transcription...')
         self.started = True
         self.recorder.start(self.current_language)
+        self.indicator.set_recording(True)
+        winsound.Beep(800, 150)  # High beep = recording
 
         if self.max_time is not None:
             self.timer = threading.Timer(self.max_time, self.stop)
@@ -215,25 +278,32 @@ class WhisperDictationApp:
         if self.timer is not None:
             self.timer.cancel()
 
-        print('Stopping...')
         self.started = False
         self.recorder.stop()
+        self.indicator.set_recording(False)
+        winsound.Beep(400, 150)  # Low beep = paused
+        print('Stopped. Dictation paused.\n')
 
         if self.tray:
             self.tray.icon = create_tray_icon('green')
-            self.tray.title = "Whisper - Ready (Ctrl+Space)"
-
-        print('Ready.\n')
+            self.tray.title = "Whisper - Paused (Ctrl+Space)"
 
     def quit(self):
         if self.started:
             self.stop()
         if self.tray:
             self.tray.stop()
+        self.indicator.destroy()
 
     def run(self):
+        # pystray runs in a background thread
+        threading.Thread(target=self._run_tray, daemon=True).start()
+        # tkinter runs on the main thread (required by Windows)
+        self.indicator.run()
+
+    def _run_tray(self):
         menu_items = [
-            pystray.MenuItem("Start/Stop (Ctrl+Space)", lambda: self.toggle()),
+            pystray.MenuItem("Record / Pause (Ctrl+Space)", lambda: self.toggle()),
         ]
 
         if self.languages and len(self.languages) > 1:
@@ -250,7 +320,7 @@ class WhisperDictationApp:
         self.tray = pystray.Icon(
             "whisper-dictation",
             create_tray_icon('green'),
-            "Whisper - Ready (Ctrl+Space)",
+            "Whisper - Paused (Ctrl+Space)",
             pystray.Menu(*menu_items)
         )
         self.tray.run()
@@ -275,8 +345,8 @@ def parse_args():
                         help='Language code, e.g. "es" or "es,en" for multi.')
     parser.add_argument('-t', '--max_time', type=float, default=120,
                         help='Max recording seconds. Default: 120')
-    parser.add_argument('--chunk', type=float, default=2.0,
-                        help='Chunk duration in seconds for streaming. Default: 2.0')
+    parser.add_argument('--chunk', type=float, default=5.0,
+                        help='Chunk duration in seconds for streaming. Default: 5.0')
     parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu'],
                         help='Device for inference. Default: cuda')
@@ -303,7 +373,7 @@ if __name__ == "__main__":
     recorder = StreamingRecorder(transcriber)
 
     app = WhisperDictationApp(recorder, args.language, args.max_time)
-    key_listener = GlobalKeyListener(app, args.key_combination)
+    key_listener = GlobalKeyListener(app, args.key_combination, transcriber)
     listener = keyboard.Listener(on_press=key_listener.on_key_press, on_release=key_listener.on_key_release)
     listener.start()
 
