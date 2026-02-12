@@ -1,2 +1,2 @@
 @echo off
-start "" "C:\Users\jmsla\whisper-dictation\.venv\Scripts\pythonw.exe" -u "C:\Users\jmsla\whisper-dictation\whisper-dictation.py" -m large-v3 -l es
+start "" "C:\Users\jmsla\whisper-dictation\.venv\Scripts\pythonw.exe" -u "C:\Users\jmsla\whisper-dictation\whisper-dictation.py" -m large-v3 -l es --gpu 1

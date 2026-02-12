@@ -9,3 +9,4 @@ build/
 whisper.log
 poetry.lock
 .env
+models/

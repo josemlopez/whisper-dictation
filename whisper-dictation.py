@@ -3,6 +3,7 @@ import time
 import threading
 import sys
 import os
+import glob as globmod
 import pyaudio
 import numpy as np
 from pynput import keyboard
@@ -25,16 +26,64 @@ if platform.system() == "Windows":
     from PIL import Image, ImageDraw, ImageTk
 
 
+class TextPolisher:
+    """Uses a small local LLM to clean up whisper output."""
+
+    def __init__(self, gpu_id=1):
+        from llama_cpp import Llama
+        model_dir = os.path.join(os.path.dirname(__file__), "models")
+        pattern = os.path.join(model_dir, "**", "*.gguf")
+        gguf_files = globmod.glob(pattern, recursive=True)
+        if not gguf_files:
+            raise FileNotFoundError(f"No GGUF model found in {model_dir}")
+        model_path = gguf_files[0]
+        print(f"Loading LLM from {os.path.basename(model_path)} on GPU {gpu_id}...")
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=512,
+            n_gpu_layers=-1,
+            main_gpu=gpu_id,
+            verbose=False,
+        )
+        print("LLM loaded!")
+
+    def polish(self, text, task="transcribe"):
+        if not text or len(text.strip()) < 3:
+            return text
+        if task == "translate":
+            prompt = (f"You are a proofreader. Fix any grammar, spelling, and punctuation errors "
+                      f"in this English text from speech recognition. Do not add or remove words "
+                      f"unless they are clearly wrong. Output ONLY the corrected text:\n\n{text}")
+        else:
+            prompt = (f"Eres un corrector de textos. Corrige errores de gramatica, ortografia y "
+                      f"puntuacion en este texto en espanol que viene de reconocimiento de voz. "
+                      f"No anadeas ni quites palabras salvo que sean claramente erroneas. "
+                      f"Devuelve SOLO el texto corregido:\n\n{text}")
+        try:
+            result = self.llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=256,
+                temperature=0.1,
+            )
+            polished = result["choices"][0]["message"]["content"].strip()
+            if polished and len(polished) > 1:
+                return polished
+        except:
+            pass
+        return text
+
+
 class StreamingTranscriber:
     """Transcribes audio in real-time using faster-whisper, typing text as you speak."""
 
     def __init__(self, model, chunk_duration=5.0, overlap_duration=0.5,
-                 energy_threshold=0.003):
+                 energy_threshold=0.003, polisher=None):
         self.model = model
         self.pykeyboard = keyboard.Controller()
         self.chunk_duration = chunk_duration
         self.overlap_duration = overlap_duration
         self.energy_threshold = energy_threshold
+        self.polisher = polisher
         self.typing = False
 
     def type_text(self, text):
@@ -79,33 +128,52 @@ class StreamingTranscriber:
         text = ""
         for segment in segments:
             text += segment.text
-        return text.strip()
+        text = text.strip()
+
+        if text and self.polisher:
+            polished = self.polisher.polish(text, task)
+            if polished != text:
+                print(f"  [RAW] {text}")
+                print(f"  [FIX] {polished}")
+            text = polished
+
+        return text
 
 
 class StreamingRecorder:
-    """Records audio and streams chunks to the transcriber in real-time."""
+    """Records audio and transcribes on stop (batch mode)."""
 
     def __init__(self, transcriber):
         self.recording = False
         self.transcriber = transcriber
         self._thread = None
+        self._audio_buffer = None
+        self._language = None
+        self._task = None
 
     def start(self, language=None, task="transcribe"):
         self.recording = True
-        self._thread = threading.Thread(target=self._stream_impl, args=(language, task), daemon=True)
+        self._language = language
+        self._task = task
+        self._audio_buffer = np.array([], dtype=np.float32)
+        self._thread = threading.Thread(target=self._record_impl, daemon=True)
         self._thread.start()
-
 
     def stop(self):
         self.recording = False
         if self._thread:
             self._thread.join(timeout=5)
+        # Transcribe the full recording
+        if self._audio_buffer is not None and len(self._audio_buffer) > 0:
+            threading.Thread(
+                target=self._transcribe_and_type,
+                args=(self._audio_buffer, self._language, self._task),
+                daemon=True,
+            ).start()
 
-    def _stream_impl(self, language, task):
+    def _record_impl(self):
         sample_rate = 16000
         frames_per_buffer = 1024
-        chunk_samples = int(self.transcriber.chunk_duration * sample_rate)
-        overlap_samples = int(self.transcriber.overlap_duration * sample_rate)
 
         p = pyaudio.PyAudio()
         stream = p.open(
@@ -116,38 +184,20 @@ class StreamingRecorder:
             input=True,
         )
 
-        audio_buffer = np.array([], dtype=np.float32)
-        prev_text = ""
-
         try:
             while self.recording:
                 data = stream.read(frames_per_buffer, exception_on_overflow=False)
                 chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                audio_buffer = np.concatenate([audio_buffer, chunk])
-
-                if len(audio_buffer) >= chunk_samples:
-                    text = self.transcriber.transcribe_chunk(audio_buffer, language, task)
-
-                    if text and text != prev_text:
-                        if prev_text and text.startswith(prev_text):
-                            new_text = text[len(prev_text):]
-                        elif prev_text:
-                            new_text = " " + text
-                        else:
-                            new_text = text
-
-                        if new_text.strip():
-                            self.transcriber.type_text(new_text)
-
-                        prev_text = text
-
-                    # Keep overlap for context continuity
-                    audio_buffer = audio_buffer[-overlap_samples:]
-
+                self._audio_buffer = np.concatenate([self._audio_buffer, chunk])
         finally:
             stream.stop_stream()
             stream.close()
             p.terminate()
+
+    def _transcribe_and_type(self, audio, language, task):
+        text = self.transcriber.transcribe_chunk(audio, language, task)
+        if text and text.strip():
+            self.transcriber.type_text(text)
 
 
 class GlobalKeyListener:
@@ -399,14 +449,18 @@ def parse_args():
                         help='Language code, e.g. "es" or "es,en" for multi.')
     parser.add_argument('-t', '--max_time', type=float, default=120,
                         help='Max recording seconds. Default: 120')
-    parser.add_argument('--chunk', type=float, default=5.0,
-                        help='Chunk duration in seconds for streaming. Default: 5.0')
+    parser.add_argument('--chunk', type=float, default=10.0,
+                        help='Chunk duration in seconds for streaming. Default: 10.0')
     parser.add_argument('--device', type=str, default='cuda',
                         choices=['cuda', 'cpu'],
                         help='Device for inference. Default: cuda')
     parser.add_argument('--compute_type', type=str, default='float16',
                         choices=['float16', 'int8', 'int8_float16', 'float32'],
                         help='Compute type. float16 for GPU, int8 for CPU. Default: float16')
+    parser.add_argument('--gpu', type=int, default=1,
+                        help='GPU device index. Default: 1 (secondary GPU)')
+    parser.add_argument('--no-polish', action='store_true',
+                        help='Disable LLM text polishing')
 
     args = parser.parse_args()
 
@@ -419,11 +473,22 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    print(f"Loading faster-whisper model '{args.model_name}' on {args.device} ({args.compute_type})...")
-    model = WhisperModel(args.model_name, device=args.device, compute_type=args.compute_type)
+    # Pin whisper to the specified GPU
+    device = f"{args.device}:{args.gpu}" if args.device == "cuda" else args.device
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
+    print(f"Loading faster-whisper model '{args.model_name}' on GPU {args.gpu} ({args.compute_type})...")
+    model = WhisperModel(args.model_name, device="cuda", compute_type=args.compute_type)
     print(f"Model loaded!")
 
-    transcriber = StreamingTranscriber(model, chunk_duration=args.chunk)
+    polisher = None
+    if not args.no_polish:
+        try:
+            polisher = TextPolisher(gpu_id=0)  # GPU 0 in visible devices (remapped)
+        except Exception as e:
+            print(f"LLM polisher not available: {e}")
+
+    transcriber = StreamingTranscriber(model, chunk_duration=args.chunk, polisher=polisher)
     print("Warming up model...")
     transcriber.warmup()
     print("Warm-up done!")
