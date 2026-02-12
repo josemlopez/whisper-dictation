@@ -27,7 +27,9 @@ if platform.system() == "Windows":
 
 
 class TextPolisher:
-    """Uses a small local LLM to clean up whisper output."""
+    """Uses a small local LLM to clean up and rewrite whisper output."""
+
+    REWRITE_CONFIG = os.path.join(os.path.dirname(__file__), "rewrite_prompt.txt")
 
     def __init__(self, gpu_id=1):
         from llama_cpp import Llama
@@ -40,12 +42,26 @@ class TextPolisher:
         print(f"Loading LLM from {os.path.basename(model_path)} on GPU {gpu_id}...")
         self.llm = Llama(
             model_path=model_path,
-            n_ctx=512,
+            n_ctx=2048,
             n_gpu_layers=-1,
             main_gpu=gpu_id,
             verbose=False,
         )
         print("LLM loaded!")
+
+    def _run_llm(self, prompt, max_tokens=512):
+        try:
+            result = self.llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.1,
+            )
+            out = result["choices"][0]["message"]["content"].strip()
+            if out and len(out) > 1:
+                return out
+        except:
+            pass
+        return None
 
     def polish(self, text, task="transcribe"):
         if not text or len(text.strip()) < 3:
@@ -59,59 +75,41 @@ class TextPolisher:
                       f"puntuacion en este texto en espanol que viene de reconocimiento de voz. "
                       f"No anadeas ni quites palabras salvo que sean claramente erroneas. "
                       f"Devuelve SOLO el texto corregido:\n\n{text}")
-        try:
-            result = self.llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=256,
-                temperature=0.1,
-            )
-            polished = result["choices"][0]["message"]["content"].strip()
-            if polished and len(polished) > 1:
-                return polished
-        except:
-            pass
-        return text
+        return self._run_llm(prompt) or text
+
+    def rewrite(self, text):
+        """Rewrite text using the custom prompt from rewrite_prompt.txt."""
+        if not os.path.exists(self.REWRITE_CONFIG):
+            return text
+        with open(self.REWRITE_CONFIG, 'r', encoding='utf-8') as f:
+            custom_prompt = f.read().strip()
+        if not custom_prompt:
+            return text
+        prompt = custom_prompt.replace("{text}", text)
+        return self._run_llm(prompt, max_tokens=1024) or text
 
 
-class StreamingTranscriber:
-    """Transcribes audio in real-time using faster-whisper, typing text as you speak."""
+class Transcriber:
+    """Transcribes audio using faster-whisper with optional LLM polishing."""
 
-    def __init__(self, model, chunk_duration=5.0, overlap_duration=0.5,
-                 energy_threshold=0.003, polisher=None):
+    def __init__(self, model, energy_threshold=0.003, polisher=None):
         self.model = model
-        self.pykeyboard = keyboard.Controller()
-        self.chunk_duration = chunk_duration
-        self.overlap_duration = overlap_duration
         self.energy_threshold = energy_threshold
         self.polisher = polisher
-        self.typing = False
-
-    def type_text(self, text):
-        self.typing = True
-        try:
-            for char in text:
-                try:
-                    self.pykeyboard.type(char)
-                    time.sleep(0.002)
-                except:
-                    pass
-        finally:
-            self.typing = False
+        self.typing = False  # Used by key listener to ignore synthetic keys
 
     def has_speech(self, audio_data):
-        """Check if audio has enough energy to contain speech."""
         rms = np.sqrt(np.mean(audio_data ** 2))
         return rms > self.energy_threshold
 
     def warmup(self):
-        """Run a tiny silent inference to wake up the GPU/model."""
-        silent = np.zeros(16000, dtype=np.float32)  # 1 second of silence
+        silent = np.zeros(16000, dtype=np.float32)
         segments, _ = self.model.transcribe(silent, beam_size=1, best_of=1,
                                             without_timestamps=True)
         for _ in segments:
             pass
 
-    def transcribe_chunk(self, audio_data, language=None, task="transcribe"):
+    def transcribe(self, audio_data, language=None, task="transcribe"):
         if not self.has_speech(audio_data):
             return ""
 
@@ -140,12 +138,13 @@ class StreamingTranscriber:
         return text
 
 
-class StreamingRecorder:
-    """Records audio and transcribes on stop (batch mode)."""
+class Recorder:
+    """Records audio and transcribes on stop. Sends text via callback."""
 
-    def __init__(self, transcriber):
+    def __init__(self, transcriber, on_text_ready=None):
         self.recording = False
         self.transcriber = transcriber
+        self.on_text_ready = on_text_ready
         self._thread = None
         self._audio_buffer = None
         self._language = None
@@ -163,10 +162,9 @@ class StreamingRecorder:
         self.recording = False
         if self._thread:
             self._thread.join(timeout=5)
-        # Transcribe the full recording
         if self._audio_buffer is not None and len(self._audio_buffer) > 0:
             threading.Thread(
-                target=self._transcribe_and_type,
+                target=self._transcribe_and_deliver,
                 args=(self._audio_buffer, self._language, self._task),
                 daemon=True,
             ).start()
@@ -194,10 +192,10 @@ class StreamingRecorder:
             stream.close()
             p.terminate()
 
-    def _transcribe_and_type(self, audio, language, task):
-        text = self.transcriber.transcribe_chunk(audio, language, task)
-        if text and text.strip():
-            self.transcriber.type_text(text)
+    def _transcribe_and_deliver(self, audio, language, task):
+        text = self.transcriber.transcribe(audio, language, task)
+        if text and text.strip() and self.on_text_ready:
+            self.on_text_ready(text)
 
 
 class GlobalKeyListener:
@@ -245,39 +243,87 @@ class GlobalKeyListener:
             self._toggled = False
 
 
-class FloatingIndicator:
-    """Small always-on-top flag indicator. Runs on main thread."""
+class FloatingUI:
+    """Flag indicator + history panel. Runs on main thread."""
 
     FLAG_WIDTH = 48
     FLAG_HEIGHT = 32
+    PANEL_WIDTH = 420
+    ENTRY_HEIGHT = 60
+    MAX_HISTORY = 10
     MARGIN = 10
 
-    def __init__(self):
+    def __init__(self, polisher=None):
         self.root = tk.Tk()
-        self.root.overrideredirect(True)
-        self.root.attributes('-topmost', True)
-        self.root.attributes('-transparentcolor', 'magenta')
-        self.root.configure(bg='magenta')
+        self.root.withdraw()
+        self._history = []
+        self._hide_timer = None
+        self._polisher = polisher
 
-        screen_w = self.root.winfo_screenwidth()
+        # --- Flag window ---
+        self._flag_win = tk.Toplevel(self.root)
+        self._flag_win.overrideredirect(True)
+        self._flag_win.attributes('-topmost', True)
+        self._flag_win.attributes('-transparentcolor', 'magenta')
+        self._flag_win.configure(bg='magenta')
+        screen_w = self._flag_win.winfo_screenwidth()
         x = screen_w - self.FLAG_WIDTH - self.MARGIN
-        y = self.MARGIN
-        self.root.geometry(f'{self.FLAG_WIDTH}x{self.FLAG_HEIGHT}+{x}+{y}')
-
-        self.canvas = tk.Canvas(self.root, width=self.FLAG_WIDTH, height=self.FLAG_HEIGHT,
-                                bg='magenta', highlightthickness=0)
-        self.canvas.pack()
-
+        self._flag_win.geometry(f'{self.FLAG_WIDTH}x{self.FLAG_HEIGHT}+{x}+{self.MARGIN}')
+        self._flag_canvas = tk.Canvas(self._flag_win, width=self.FLAG_WIDTH,
+                                       height=self.FLAG_HEIGHT, bg='magenta',
+                                       highlightthickness=0)
+        self._flag_canvas.pack()
         self._flag_images = {}
         self._create_flags()
         self._current_flag = None
-        self.root.withdraw()
+        self._flag_win.withdraw()
+
+        # --- History panel ---
+        self._panel = tk.Toplevel(self.root)
+        self._panel.overrideredirect(True)
+        self._panel.attributes('-topmost', True)
+        self._panel.configure(bg='#1e1e1e')
+        screen_h = self._panel.winfo_screenheight()
+        panel_h = self.ENTRY_HEIGHT * self.MAX_HISTORY + 30
+        px = screen_w - self.PANEL_WIDTH - self.MARGIN
+        py = screen_h - panel_h - 60
+        self._panel.geometry(f'{self.PANEL_WIDTH}x{panel_h}+{px}+{py}')
+
+        header = tk.Frame(self._panel, bg='#1e1e1e')
+        header.pack(fill='x', padx=4, pady=(4, 0))
+        title = tk.Label(header, text="Whisper History (click to copy)",
+                         bg='#1e1e1e', fg='#888888', font=('Segoe UI', 9))
+        title.pack(side='left', padx=4)
+        close_btn = tk.Label(header, text="\u2715", bg='#1e1e1e', fg='#666666',
+                             font=('Segoe UI', 11), cursor='hand2')
+        close_btn.pack(side='right', padx=4)
+        close_btn.bind('<Button-1>', lambda e: self._panel.withdraw())
+        prompt_btn = tk.Label(header, text="Edit Prompt", bg='#3a3a5c', fg='#cccccc',
+                              font=('Segoe UI', 8), padx=6, pady=2, cursor='hand2')
+        prompt_btn.pack(side='right', padx=4)
+        prompt_btn.bind('<Button-1>', lambda e: self._open_prompt_editor())
+
+        self._scrollable = tk.Frame(self._panel, bg='#1e1e1e')
+        self._scrollable.pack(fill='both', expand=True, padx=4, pady=4)
+        self._entry_rows = []
+        for i in range(self.MAX_HISTORY):
+            row = tk.Frame(self._scrollable, bg='#2d2d2d')
+            row.pack(fill='x', pady=2)
+            lbl = tk.Label(row, text="", bg='#2d2d2d', fg='#cccccc',
+                           font=('Segoe UI', 10), anchor='nw', justify='left',
+                           wraplength=self.PANEL_WIDTH - 90, padx=8, pady=6,
+                           cursor='hand2')
+            lbl.pack(side='left', fill='x', expand=True)
+            lbl.bind('<Button-1>', lambda e, idx=i: self._copy_entry(idx))
+            rw_btn = tk.Label(row, text="Rewrite", bg='#3a5a3a', fg='#cccccc',
+                              font=('Segoe UI', 8), padx=6, pady=4, cursor='hand2')
+            rw_btn.pack(side='right', padx=4, pady=4)
+            rw_btn.bind('<Button-1>', lambda e, idx=i: self._rewrite_entry(idx))
+            self._entry_rows.append({'frame': row, 'label': lbl, 'rewrite': rw_btn})
+        self._panel.withdraw()
 
     def _create_flags(self):
-        """Create flag images using PIL."""
         w, h = self.FLAG_WIDTH, self.FLAG_HEIGHT
-
-        # Spain flag: red-yellow-red (1:2:1)
         es_img = Image.new('RGB', (w, h))
         es_draw = ImageDraw.Draw(es_img)
         stripe = h // 4
@@ -286,36 +332,152 @@ class FloatingIndicator:
         es_draw.rectangle([0, stripe * 3, w, h], fill='#c60b1e')
         self._flag_images['es'] = ImageTk.PhotoImage(es_img)
 
-        # UK flag (simplified): blue bg, white cross, red cross
         en_img = Image.new('RGB', (w, h), '#012169')
         en_draw = ImageDraw.Draw(en_img)
-        # White cross
         en_draw.rectangle([w // 2 - 3, 0, w // 2 + 3, h], fill='white')
         en_draw.rectangle([0, h // 2 - 2, w, h // 2 + 2], fill='white')
-        # Red cross
         en_draw.rectangle([w // 2 - 1, 0, w // 2 + 1, h], fill='#C8102E')
         en_draw.rectangle([0, h // 2 - 1, w, h // 2 + 1], fill='#C8102E')
         self._flag_images['en'] = ImageTk.PhotoImage(en_img)
 
     def show_flag(self, lang):
-        """Thread-safe: show a flag on the indicator."""
         self.root.after(0, self._do_show_flag, lang)
 
     def _do_show_flag(self, lang):
-        self.canvas.delete('all')
+        self._flag_canvas.delete('all')
         img = self._flag_images.get(lang)
         if img:
-            self._current_flag = img  # Keep reference to prevent GC
-            self.canvas.create_image(0, 0, anchor='nw', image=img)
-        self.root.deiconify()
-        self.root.lift()
+            self._current_flag = img
+            self._flag_canvas.create_image(0, 0, anchor='nw', image=img)
+        self._flag_win.deiconify()
+        self._flag_win.lift()
 
-    def hide(self):
-        """Thread-safe hide."""
-        self.root.after(0, self.root.withdraw)
+    def hide_flag(self):
+        self.root.after(0, self._flag_win.withdraw)
+
+    def add_text(self, text):
+        """Thread-safe: add text to history, copy to clipboard, show panel."""
+        self.root.after(0, self._do_add_text, text)
+
+    def _do_add_text(self, text):
+        self._history.insert(0, text)
+        self._history = self._history[:self.MAX_HISTORY]
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._refresh_entries()
+        self._panel.deiconify()
+        self._panel.lift()
+        if self._hide_timer is not None:
+            self.root.after_cancel(self._hide_timer)
+        self._hide_timer = self.root.after(30000, self._panel.withdraw)
+        winsound.Beep(600, 100)
+
+    def _refresh_entries(self):
+        for i, row in enumerate(self._entry_rows):
+            if i < len(self._history):
+                display = self._history[i]
+                if len(display) > 150:
+                    display = display[:147] + "..."
+                bg = '#3a3a5c' if i == 0 else '#2d2d2d'
+                row['label'].configure(text=display, bg=bg)
+                row['frame'].configure(bg=bg)
+            else:
+                row['label'].configure(text="", bg='#2d2d2d')
+                row['frame'].configure(bg='#2d2d2d')
+
+    def _copy_entry(self, idx):
+        if idx < len(self._history):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self._history[idx])
+            row = self._entry_rows[idx]
+            row['label'].configure(bg='#4a4a7c')
+            self.root.after(300, lambda: row['label'].configure(
+                bg='#3a3a5c' if idx == 0 else '#2d2d2d'))
+            winsound.Beep(600, 80)
+
+    def _rewrite_entry(self, idx):
+        if idx >= len(self._history) or not self._polisher:
+            return
+        row = self._entry_rows[idx]
+        row['rewrite'].configure(text="...", bg='#5a5a3a')
+        threading.Thread(
+            target=self._do_rewrite, args=(idx,), daemon=True
+        ).start()
+
+    def _do_rewrite(self, idx):
+        text = self._history[idx]
+        rewritten = self._polisher.rewrite(text)
+        print(f"  [REWRITE] {rewritten[:80]}...")
+        self.root.after(0, self._apply_rewrite, idx, rewritten)
+
+    def _apply_rewrite(self, idx, rewritten):
+        self._history[idx] = rewritten
+        self.root.clipboard_clear()
+        self.root.clipboard_append(rewritten)
+        self._refresh_entries()
+        row = self._entry_rows[idx]
+        row['rewrite'].configure(text="Rewrite", bg='#3a5a3a')
+        row['label'].configure(bg='#3a5c3a')
+        self.root.after(500, lambda: row['label'].configure(
+            bg='#3a3a5c' if idx == 0 else '#2d2d2d'))
+        winsound.Beep(700, 80)
+
+    def _open_prompt_editor(self):
+        config_path = TextPolisher.REWRITE_CONFIG
+        current = ""
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                current = f.read()
+
+        editor = tk.Toplevel(self.root)
+        editor.title("Rewrite Prompt")
+        editor.attributes('-topmost', True)
+        editor.configure(bg='#1e1e1e')
+        editor.geometry('500x350')
+
+        info = tk.Label(editor, text="Use {text} where your dictation should go.",
+                        bg='#1e1e1e', fg='#888888', font=('Segoe UI', 9))
+        info.pack(anchor='w', padx=10, pady=(8, 4))
+
+        text_widget = tk.Text(editor, bg='#2d2d2d', fg='#cccccc', insertbackground='white',
+                              font=('Consolas', 11), wrap='word', padx=8, pady=8)
+        text_widget.pack(fill='both', expand=True, padx=10, pady=(0, 4))
+        text_widget.insert('1.0', current)
+
+        btn_frame = tk.Frame(editor, bg='#1e1e1e')
+        btn_frame.pack(fill='x', padx=10, pady=(0, 8))
+
+        def save():
+            content = text_widget.get('1.0', 'end-1c')
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            winsound.Beep(600, 80)
+            editor.destroy()
+
+        save_btn = tk.Button(btn_frame, text="Save", command=save,
+                             bg='#3a5a3a', fg='white', font=('Segoe UI', 10),
+                             padx=16, pady=4, cursor='hand2')
+        save_btn.pack(side='right')
+        cancel_btn = tk.Button(btn_frame, text="Cancel", command=editor.destroy,
+                               bg='#5a3a3a', fg='white', font=('Segoe UI', 10),
+                               padx=16, pady=4, cursor='hand2')
+        cancel_btn.pack(side='right', padx=(0, 8))
+
+    def show_panel(self):
+        """Thread-safe: show the history panel."""
+        self.root.after(0, self._do_show_panel)
+
+    def _do_show_panel(self):
+        self._panel.deiconify()
+        self._panel.lift()
+        if self._hide_timer is not None:
+            self.root.after_cancel(self._hide_timer)
+        self._hide_timer = self.root.after(30000, self._panel.withdraw)
+
+    def hide_panel(self):
+        self.root.after(0, self._panel.withdraw)
 
     def run(self):
-        """Blocks - runs the tkinter mainloop on the main thread."""
         self.root.mainloop()
 
     def destroy(self):
@@ -330,26 +492,30 @@ def create_tray_icon(color):
 
 
 class WhisperDictationApp:
-    def __init__(self, recorder, languages=None, max_time=None):
+    def __init__(self, recorder, languages=None, max_time=None, polisher=None):
         self.languages = languages
         self.current_language = languages[0] if languages else None
-        self.current_task = None  # None=stopped, "transcribe"=ES, "translate"=ES->EN
+        self.current_task = None
         self.started = False
         self.recorder = recorder
+        self.recorder.on_text_ready = self._on_text_ready
         self.max_time = max_time
         self.timer = None
         self.tray = None
-        self.indicator = FloatingIndicator()
+        self.ui = FloatingUI(polisher=polisher)
+
+    def _on_text_ready(self, text):
+        """Called from background thread when transcription is done."""
+        print(f"  [CLIPBOARD] {text[:80]}...")
+        self.ui.add_text(text)
 
     def toggle_es(self):
-        """Ctrl+Space: toggle Spanish transcription on/off."""
         if self.started:
             self.stop()
         else:
             self.start("transcribe")
 
     def toggle_en(self):
-        """Ctrl+Shift: toggle ES->EN translation on/off."""
         if self.started:
             self.stop()
         else:
@@ -366,7 +532,7 @@ class WhisperDictationApp:
         print(f'Recording [{mode_label}]...')
         self.started = True
         self.recorder.start(self.current_language, task)
-        self.indicator.show_flag(flag)
+        self.ui.show_flag(flag)
         winsound.Beep(800, 150)
 
         if self.max_time is not None:
@@ -388,9 +554,9 @@ class WhisperDictationApp:
 
         self.started = False
         self.recorder.stop()
-        self.indicator.hide()
+        self.ui.hide_flag()
         winsound.Beep(400, 150)
-        print('Stopped. Dictation paused.\n')
+        print('Stopped. Processing...\n')
 
         if self.tray:
             self.tray.icon = create_tray_icon('green')
@@ -401,10 +567,9 @@ class WhisperDictationApp:
             self.stop()
         if self.tray:
             self.tray.stop()
-        self.indicator.destroy()
+        self.ui.destroy()
 
     def _keepalive_loop(self):
-        """Periodically warm up the model so GPU stays ready."""
         while True:
             time.sleep(60)
             if not self.started:
@@ -416,12 +581,13 @@ class WhisperDictationApp:
     def run(self):
         threading.Thread(target=self._run_tray, daemon=True).start()
         threading.Thread(target=self._keepalive_loop, daemon=True).start()
-        self.indicator.run()
+        self.ui.run()
 
     def _run_tray(self):
         menu_items = [
             pystray.MenuItem("Spanish (Ctrl+Space)", lambda: self.toggle_es()),
             pystray.MenuItem("English (Shift+Space)", lambda: self.toggle_en()),
+            pystray.MenuItem("Show History", lambda: self.ui.show_panel()),
             pystray.MenuItem("Quit", lambda: self.quit()),
         ]
 
@@ -447,8 +613,8 @@ def parse_args():
                         help='Key combo to toggle. Default: ctrl_l+space')
     parser.add_argument('-l', '--language', type=str, default=None,
                         help='Language code, e.g. "es" or "es,en" for multi.')
-    parser.add_argument('-t', '--max_time', type=float, default=120,
-                        help='Max recording seconds. Default: 120')
+    parser.add_argument('-t', '--max_time', type=float, default=None,
+                        help='Max recording seconds. Default: unlimited')
     parser.add_argument('--chunk', type=float, default=10.0,
                         help='Chunk duration in seconds for streaming. Default: 10.0')
     parser.add_argument('--device', type=str, default='cuda',
@@ -488,13 +654,13 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"LLM polisher not available: {e}")
 
-    transcriber = StreamingTranscriber(model, chunk_duration=args.chunk, polisher=polisher)
+    transcriber = Transcriber(model, polisher=polisher)
     print("Warming up model...")
     transcriber.warmup()
     print("Warm-up done!")
-    recorder = StreamingRecorder(transcriber)
+    recorder = Recorder(transcriber)
 
-    app = WhisperDictationApp(recorder, args.language, args.max_time)
+    app = WhisperDictationApp(recorder, args.language, args.max_time, polisher=polisher)
 
     # Ctrl+Space = Spanish transcription
     es_listener = GlobalKeyListener(app, args.key_combination, transcriber)
@@ -517,5 +683,5 @@ if __name__ == "__main__":
 
     print(f"Running! Press Ctrl+Space for Spanish dictation.")
     print(f"Press Shift+Space for ES->EN translation.")
-    print(f"Text will appear where your cursor is, in real-time.")
+    print(f"Text goes to clipboard - paste with Ctrl+V.")
     app.run()

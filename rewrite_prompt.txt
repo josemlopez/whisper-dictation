@@ -1,0 +1,3 @@
+Rewrite the following text in professional English suitable for business emails and messages. Make it clear, concise, and natural-sounding. Do not add information that is not in the original. Output ONLY the rewritten text:
+
+{text}
