@@ -22,7 +22,7 @@ from faster_whisper import WhisperModel
 
 if platform.system() == "Windows":
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageTk
 
 
 class StreamingTranscriber:
@@ -62,13 +62,14 @@ class StreamingTranscriber:
         for _ in segments:
             pass
 
-    def transcribe_chunk(self, audio_data, language=None):
+    def transcribe_chunk(self, audio_data, language=None, task="transcribe"):
         if not self.has_speech(audio_data):
             return ""
 
         segments, _ = self.model.transcribe(
             audio_data,
             language=language,
+            task=task,
             beam_size=1,
             best_of=1,
             vad_filter=True,
@@ -89,9 +90,9 @@ class StreamingRecorder:
         self.transcriber = transcriber
         self._thread = None
 
-    def start(self, language=None):
+    def start(self, language=None, task="transcribe"):
         self.recording = True
-        self._thread = threading.Thread(target=self._stream_impl, args=(language,), daemon=True)
+        self._thread = threading.Thread(target=self._stream_impl, args=(language, task), daemon=True)
         self._thread.start()
 
 
@@ -100,7 +101,7 @@ class StreamingRecorder:
         if self._thread:
             self._thread.join(timeout=5)
 
-    def _stream_impl(self, language):
+    def _stream_impl(self, language, task):
         sample_rate = 16000
         frames_per_buffer = 1024
         chunk_samples = int(self.transcriber.chunk_duration * sample_rate)
@@ -125,7 +126,7 @@ class StreamingRecorder:
                 audio_buffer = np.concatenate([audio_buffer, chunk])
 
                 if len(audio_buffer) >= chunk_samples:
-                    text = self.transcriber.transcribe_chunk(audio_buffer, language)
+                    text = self.transcriber.transcribe_chunk(audio_buffer, language, task)
 
                     if text and text != prev_text:
                         if prev_text and text.startswith(prev_text):
@@ -153,6 +154,7 @@ class GlobalKeyListener:
     def __init__(self, app, key_combination, transcriber):
         self.app = app
         self.transcriber = transcriber
+        self.action = None  # Set after creation
         self.key1, self.key2 = self.parse_key_combination(key_combination)
         self.key1_pressed = False
         self.key2_pressed = False
@@ -179,7 +181,8 @@ class GlobalKeyListener:
 
         if self.key1_pressed and self.key2_pressed and not self._toggled:
             self._toggled = True
-            self.app.toggle()
+            if self.action:
+                self.action()
 
     def on_key_release(self, key):
         if self.transcriber.typing:
@@ -193,42 +196,76 @@ class GlobalKeyListener:
 
 
 class FloatingIndicator:
-    """Small always-on-top dot in the corner of the screen. Runs on main thread."""
+    """Small always-on-top flag indicator. Runs on main thread."""
 
-    def __init__(self, size=24, margin=10):
-        self.size = size
+    FLAG_WIDTH = 48
+    FLAG_HEIGHT = 32
+    MARGIN = 10
+
+    def __init__(self):
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
-        self.root.attributes('-transparentcolor', 'black')
-        self.root.configure(bg='black')
+        self.root.attributes('-transparentcolor', 'magenta')
+        self.root.configure(bg='magenta')
 
         screen_w = self.root.winfo_screenwidth()
-        x = screen_w - size - margin
-        y = margin
-        self.root.geometry(f'{size}x{size}+{x}+{y}')
+        x = screen_w - self.FLAG_WIDTH - self.MARGIN
+        y = self.MARGIN
+        self.root.geometry(f'{self.FLAG_WIDTH}x{self.FLAG_HEIGHT}+{x}+{y}')
 
-        self.canvas = tk.Canvas(self.root, width=size, height=size,
-                                bg='black', highlightthickness=0)
+        self.canvas = tk.Canvas(self.root, width=self.FLAG_WIDTH, height=self.FLAG_HEIGHT,
+                                bg='magenta', highlightthickness=0)
         self.canvas.pack()
-        self.dot = self.canvas.create_oval(2, 2, size - 2, size - 2, fill='#ef4444',
-                                           outline='')
-        self.root.withdraw()  # Start hidden
 
-    def set_recording(self, recording):
-        """Thread-safe: schedules the update on the tkinter main thread."""
-        self.root.after(0, self._do_set_recording, recording)
+        self._flag_images = {}
+        self._create_flags()
+        self._current_flag = None
+        self.root.withdraw()
 
-    def _do_set_recording(self, recording):
-        if recording:
-            self.canvas.itemconfig(self.dot, fill='#ef4444')
-            self.root.deiconify()
-            self.root.lift()
-        else:
-            self.root.withdraw()
+    def _create_flags(self):
+        """Create flag images using PIL."""
+        w, h = self.FLAG_WIDTH, self.FLAG_HEIGHT
+
+        # Spain flag: red-yellow-red (1:2:1)
+        es_img = Image.new('RGB', (w, h))
+        es_draw = ImageDraw.Draw(es_img)
+        stripe = h // 4
+        es_draw.rectangle([0, 0, w, stripe], fill='#c60b1e')
+        es_draw.rectangle([0, stripe, w, stripe * 3], fill='#ffc400')
+        es_draw.rectangle([0, stripe * 3, w, h], fill='#c60b1e')
+        self._flag_images['es'] = ImageTk.PhotoImage(es_img)
+
+        # UK flag (simplified): blue bg, white cross, red cross
+        en_img = Image.new('RGB', (w, h), '#012169')
+        en_draw = ImageDraw.Draw(en_img)
+        # White cross
+        en_draw.rectangle([w // 2 - 3, 0, w // 2 + 3, h], fill='white')
+        en_draw.rectangle([0, h // 2 - 2, w, h // 2 + 2], fill='white')
+        # Red cross
+        en_draw.rectangle([w // 2 - 1, 0, w // 2 + 1, h], fill='#C8102E')
+        en_draw.rectangle([0, h // 2 - 1, w, h // 2 + 1], fill='#C8102E')
+        self._flag_images['en'] = ImageTk.PhotoImage(en_img)
+
+    def show_flag(self, lang):
+        """Thread-safe: show a flag on the indicator."""
+        self.root.after(0, self._do_show_flag, lang)
+
+    def _do_show_flag(self, lang):
+        self.canvas.delete('all')
+        img = self._flag_images.get(lang)
+        if img:
+            self._current_flag = img  # Keep reference to prevent GC
+            self.canvas.create_image(0, 0, anchor='nw', image=img)
+        self.root.deiconify()
+        self.root.lift()
+
+    def hide(self):
+        """Thread-safe hide."""
+        self.root.after(0, self.root.withdraw)
 
     def run(self):
-        """Blocks — runs the tkinter mainloop on the main thread."""
+        """Blocks - runs the tkinter mainloop on the main thread."""
         self.root.mainloop()
 
     def destroy(self):
@@ -246,6 +283,7 @@ class WhisperDictationApp:
     def __init__(self, recorder, languages=None, max_time=None):
         self.languages = languages
         self.current_language = languages[0] if languages else None
+        self.current_task = None  # None=stopped, "transcribe"=ES, "translate"=ES->EN
         self.started = False
         self.recorder = recorder
         self.max_time = max_time
@@ -253,26 +291,43 @@ class WhisperDictationApp:
         self.tray = None
         self.indicator = FloatingIndicator()
 
-    def toggle(self):
+    def toggle_es(self):
+        """Ctrl+Space: toggle Spanish transcription on/off."""
         if self.started:
             self.stop()
         else:
-            self.start()
+            self.start("transcribe")
 
-    def start(self):
-        print('Recording + streaming transcription...')
+    def toggle_en(self):
+        """Ctrl+Shift: toggle ES->EN translation on/off."""
+        if self.started:
+            self.stop()
+        else:
+            self.start("translate")
+
+    def start(self, task):
+        self.current_task = task
+        if task == "translate":
+            mode_label = "ES->EN"
+            flag = "en"
+        else:
+            mode_label = self.current_language or "auto"
+            flag = "es"
+        print(f'Recording [{mode_label}]...')
         self.started = True
-        self.recorder.start(self.current_language)
-        self.indicator.set_recording(True)
-        winsound.Beep(800, 150)  # High beep = recording
+        self.recorder.start(self.current_language, task)
+        self.indicator.show_flag(flag)
+        winsound.Beep(800, 150)
 
         if self.max_time is not None:
             self.timer = threading.Timer(self.max_time, self.stop)
             self.timer.start()
 
         if self.tray:
-            self.tray.icon = create_tray_icon('red')
-            self.tray.title = "Whisper - RECORDING"
+            color = '#3b82f6' if task == "translate" else 'red'
+            label = f"RECORDING [{mode_label}]"
+            self.tray.icon = create_tray_icon(color)
+            self.tray.title = f"Whisper - {label}"
 
     def stop(self):
         if not self.started:
@@ -283,13 +338,13 @@ class WhisperDictationApp:
 
         self.started = False
         self.recorder.stop()
-        self.indicator.set_recording(False)
-        winsound.Beep(400, 150)  # Low beep = paused
+        self.indicator.hide()
+        winsound.Beep(400, 150)
         print('Stopped. Dictation paused.\n')
 
         if self.tray:
             self.tray.icon = create_tray_icon('green')
-            self.tray.title = "Whisper - Paused (Ctrl+Space)"
+            self.tray.title = "Whisper - Paused"
 
     def quit(self):
         if self.started:
@@ -315,31 +370,18 @@ class WhisperDictationApp:
 
     def _run_tray(self):
         menu_items = [
-            pystray.MenuItem("Record / Pause (Ctrl+Space)", lambda: self.toggle()),
+            pystray.MenuItem("Spanish (Ctrl+Space)", lambda: self.toggle_es()),
+            pystray.MenuItem("English (Shift+Space)", lambda: self.toggle_en()),
+            pystray.MenuItem("Quit", lambda: self.quit()),
         ]
-
-        if self.languages and len(self.languages) > 1:
-            lang_items = []
-            for lang in self.languages:
-                lang_items.append(
-                    pystray.MenuItem(lang, lambda _, l=lang: self._set_language(l),
-                                     checked=lambda item, l=lang: self.current_language == l)
-                )
-            menu_items.append(pystray.MenuItem("Language", pystray.Menu(*lang_items)))
-
-        menu_items.append(pystray.MenuItem("Quit", lambda: self.quit()))
 
         self.tray = pystray.Icon(
             "whisper-dictation",
             create_tray_icon('green'),
-            "Whisper - Paused (Ctrl+Space)",
+            "Whisper - Paused",
             pystray.Menu(*menu_items)
         )
         self.tray.run()
-
-    def _set_language(self, lang):
-        self.current_language = lang
-        print(f"Language: {lang}")
 
 
 def parse_args():
@@ -349,8 +391,8 @@ def parse_args():
                         choices=['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en',
                                  'medium', 'medium.en', 'large-v2', 'large-v3',
                                  'large-v3-turbo', 'turbo'],
-                        default='large-v3-turbo',
-                        help='Whisper model. Default: large-v3-turbo')
+                        default='large-v3',
+                        help='Whisper model. Default: large-v3')
     parser.add_argument('-k', '--key_combination', type=str, default='ctrl_l+space',
                         help='Key combo to toggle. Default: ctrl_l+space')
     parser.add_argument('-l', '--language', type=str, default=None,
@@ -388,10 +430,27 @@ if __name__ == "__main__":
     recorder = StreamingRecorder(transcriber)
 
     app = WhisperDictationApp(recorder, args.language, args.max_time)
-    key_listener = GlobalKeyListener(app, args.key_combination, transcriber)
-    listener = keyboard.Listener(on_press=key_listener.on_key_press, on_release=key_listener.on_key_release)
+
+    # Ctrl+Space = Spanish transcription
+    es_listener = GlobalKeyListener(app, args.key_combination, transcriber)
+    es_listener.action = app.toggle_es
+
+    # Shift+Space = English translation (ES->EN)
+    en_listener = GlobalKeyListener(app, 'shift_l+space', transcriber)
+    en_listener.action = app.toggle_en
+
+    def on_press(key):
+        es_listener.on_key_press(key)
+        en_listener.on_key_press(key)
+
+    def on_release(key):
+        es_listener.on_key_release(key)
+        en_listener.on_key_release(key)
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
     listener.start()
 
-    print(f"Running! Press Ctrl+Space to start/stop dictation.")
+    print(f"Running! Press Ctrl+Space for Spanish dictation.")
+    print(f"Press Shift+Space for ES->EN translation.")
     print(f"Text will appear where your cursor is, in real-time.")
     app.run()
